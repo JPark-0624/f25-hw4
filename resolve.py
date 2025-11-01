@@ -31,6 +31,7 @@ ROOT_SERVERS = ("198.41.0.4",
                 "199.7.83.42",
                 "202.12.27.33")
 
+CACHE = {}
 
 def collect_results(name: str) -> dict:
     """
@@ -87,14 +88,141 @@ def lookup(target_name: dns.name.Name,
     """
     This function uses a recursive resolver to find the relevant answer to the
     query.
-
-    TODO: replace this implementation with one which asks the root servers
-    and recurses to find the proper answer.
     """
-    outbound_query = dns.message.make_query(target_name, qtype)
-    response = dns.query.udp(outbound_query, "8.8.8.8", 3)
-    return response
-
+    # 캐시 키 생성
+    cache_key = (str(target_name), qtype)
+    
+    # 캐시에 있으면 반환
+    if cache_key in CACHE:
+        return CACHE[cache_key]
+        
+    # 캐시에서 가장 가까운 네임서버 찾기
+    nameservers = None
+    labels = target_name.labels
+    
+    # 도메인을 거슬러 올라가며 캐시된 NS 레코드 찾기
+    for i in range(len(labels)):
+        parent = dns.name.Name(labels[i:])
+        ns_cache_key = (str(parent), dns.rdatatype.NS)
+        if ns_cache_key in CACHE:
+            cached_response = CACHE[ns_cache_key]
+            ns_names = []
+            for answer in cached_response.answer:
+                if answer.rdtype == dns.rdatatype.NS:
+                    for rdata in answer:
+                        ns_names.append(rdata.target)
+            
+            nameservers = []
+            for ns_name in ns_names:
+                ns_ip_key = (str(ns_name), dns.rdatatype.A)
+                if ns_ip_key in CACHE:
+                    ns_response = CACHE[ns_ip_key]
+                    for ans in ns_response.answer:
+                        if ans.rdtype == dns.rdatatype.A:
+                            for rdata in ans:
+                                nameservers.append(rdata.address)
+            
+            if nameservers:
+                break
+    
+    if not nameservers:
+        nameservers = list(ROOT_SERVERS)
+    
+    current_target = target_name
+    
+    while True:
+        found_next = False
+        
+        # 모든 네임서버를 exhaustively 시도
+        for ns in nameservers:
+            try:
+                outbound_query = dns.message.make_query(current_target, qtype)
+                
+                # 3초 타임아웃으로 쿼리 실행
+                try:
+                    response = dns.query.udp(outbound_query, ns, 3)
+                except dns.exception.Timeout:
+                    # 타임아웃 - 다음 서버 시도
+                    continue
+                except OSError:
+                    # 네트워크 에러 - 다음 서버 시도
+                    continue
+                
+                # ANSWER 섹션 확인
+                if len(response.answer) > 0:
+                    for answer in response.answer:
+                        if answer.rdtype == dns.rdatatype.CNAME:
+                            current_target = answer[0].target
+                            nameservers = list(ROOT_SERVERS)
+                            found_next = True
+                            break
+                    
+                    if not found_next:
+                        CACHE[cache_key] = response
+                        return response
+                    break
+                
+                # AUTHORITY 섹션에서 다음 네임서버 찾기
+                if len(response.authority) > 0:
+                    new_nameservers = []
+                    ns_names = []
+                    
+                    for authority in response.authority:
+                        if authority.rdtype == dns.rdatatype.NS:
+                            for rdata in authority:
+                                ns_names.append(rdata.target)
+                    
+                    # NS 레코드가 있으면 계속 진행
+                    if ns_names:
+                        # 중간 결과 캐싱
+                        zone_name = response.authority[0].name
+                        zone_cache_key = (str(zone_name), dns.rdatatype.NS)
+                        if zone_cache_key not in CACHE:
+                            ns_response = dns.message.make_response(outbound_query)
+                            ns_response.answer = response.authority
+                            CACHE[zone_cache_key] = ns_response
+                        
+                        for additional in response.additional:
+                            if additional.rdtype == dns.rdatatype.A:
+                                new_nameservers.append(additional[0].address)
+                                ns_ip_key = (str(additional.name), dns.rdatatype.A)
+                                if ns_ip_key not in CACHE:
+                                    ns_ip_response = dns.message.make_response(outbound_query)
+                                    ns_ip_response.answer = [additional]
+                                    CACHE[ns_ip_key] = ns_ip_response
+                        
+                        # unglued 네임서버 처리
+                        if not new_nameservers:
+                            for ns_name in ns_names:
+                                try:
+                                    ns_response = lookup(ns_name, dns.rdatatype.A)
+                                    for answer in ns_response.answer:
+                                        if answer.rdtype == dns.rdatatype.A:
+                                            for rdata in answer:
+                                                new_nameservers.append(rdata.address)
+                                    if new_nameservers:
+                                        break
+                                except Exception:
+                                    continue
+                        
+                        if new_nameservers:
+                            nameservers = new_nameservers
+                            found_next = True
+                            break
+                    else:
+                        # NS 레코드가 아닌 다른 AUTHORITY (예: SOA) - 결과 없음
+                        # 이건 정상적인 "도메인 없음" 응답
+                        CACHE[cache_key] = response
+                        return response
+                        
+            except Exception as e:
+                continue
+        
+        # 모든 서버를 시도했지만 결과가 없으면 빈 응답 반환
+        if not found_next:
+            response = dns.message.make_response(outbound_query)
+            CACHE[cache_key] = response
+            return response
 
 def print_results(results: dict) -> None:
     """
