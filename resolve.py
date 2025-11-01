@@ -40,32 +40,52 @@ def collect_results(name: str) -> dict:
     """
     full_response = {}
     target_name = dns.name.from_text(name)
-    # lookup CNAME
-    response = lookup(target_name, dns.rdatatype.CNAME)
+    
+    # CNAME 체인 추적
     cnames = []
-    tmp = name
-    for answers in response.answer:
-        for answer in answers:
-            cnames.append({"name": answer, "alias": tmp})
-            tmp = answer
+    current_name = target_name
+    
+    # CNAME을 따라가며 모두 수집
+    while True:
+        response = lookup(current_name, dns.rdatatype.CNAME)
+        found_cname = False
+        
+        for answers in response.answer:
+            for answer in answers:
+                if answer.rdtype == dns.rdatatype.CNAME:
+                    cnames.append({"name": answer.target, "alias": current_name})
+                    current_name = answer.target
+                    found_cname = True
+                    break
+            if found_cname:
+                break
+        
+        if not found_cname:
+            break
+    
+    # 최종 도메인 이름 (CNAME 체인의 끝)
+    final_name = current_name
+    
     # lookup A
-    response = lookup(target_name, dns.rdatatype.A)
+    response = lookup(final_name, dns.rdatatype.A)
     arecords = []
     for answers in response.answer:
         a_name = answers.name
         for answer in answers:
             if answer.rdtype == 1:  # A record
                 arecords.append({"name": a_name, "address": str(answer)})
+    
     # lookup AAAA
-    response = lookup(target_name, dns.rdatatype.AAAA)
+    response = lookup(final_name, dns.rdatatype.AAAA)
     aaaarecords = []
     for answers in response.answer:
         aaaa_name = answers.name
         for answer in answers:
             if answer.rdtype == 28:  # AAAA record
                 aaaarecords.append({"name": aaaa_name, "address": str(answer)})
+    
     # lookup MX
-    response = lookup(target_name, dns.rdatatype.MX)
+    response = lookup(final_name, dns.rdatatype.MX)
     mxrecords = []
     for answers in response.answer:
         mx_name = answers.name
@@ -95,12 +115,11 @@ def lookup(target_name: dns.name.Name,
     # 캐시에 있으면 반환
     if cache_key in CACHE:
         return CACHE[cache_key]
-        
+    
     # 캐시에서 가장 가까운 네임서버 찾기
     nameservers = None
     labels = target_name.labels
     
-    # 도메인을 거슬러 올라가며 캐시된 NS 레코드 찾기
     for i in range(len(labels)):
         parent = dns.name.Name(labels[i:])
         ns_cache_key = (str(parent), dns.rdatatype.NS)
@@ -133,23 +152,31 @@ def lookup(target_name: dns.name.Name,
     while True:
         found_next = False
         
-        # 모든 네임서버를 exhaustively 시도
         for ns in nameservers:
             try:
                 outbound_query = dns.message.make_query(current_target, qtype)
                 
-                # 3초 타임아웃으로 쿼리 실행
                 try:
                     response = dns.query.udp(outbound_query, ns, 3)
                 except dns.exception.Timeout:
-                    # 타임아웃 - 다음 서버 시도
                     continue
                 except OSError:
-                    # 네트워크 에러 - 다음 서버 시도
                     continue
                 
                 # ANSWER 섹션 확인
                 if len(response.answer) > 0:
+                    # CNAME 타입으로 조회한 경우 - CNAME 응답 그대로 반환
+                    if qtype == dns.rdatatype.CNAME:
+                        for answer in response.answer:
+                            if answer.rdtype == dns.rdatatype.CNAME:
+                                CACHE[cache_key] = response
+                                return response
+                        # CNAME이 없으면 빈 응답
+                        empty_response = dns.message.make_response(outbound_query)
+                        CACHE[cache_key] = empty_response
+                        return empty_response
+                    
+                    # 다른 타입 조회 시 CNAME을 따라감
                     for answer in response.answer:
                         if answer.rdtype == dns.rdatatype.CNAME:
                             current_target = answer[0].target
@@ -172,9 +199,7 @@ def lookup(target_name: dns.name.Name,
                             for rdata in authority:
                                 ns_names.append(rdata.target)
                     
-                    # NS 레코드가 있으면 계속 진행
                     if ns_names:
-                        # 중간 결과 캐싱
                         zone_name = response.authority[0].name
                         zone_cache_key = (str(zone_name), dns.rdatatype.NS)
                         if zone_cache_key not in CACHE:
@@ -191,7 +216,6 @@ def lookup(target_name: dns.name.Name,
                                     ns_ip_response.answer = [additional]
                                     CACHE[ns_ip_key] = ns_ip_response
                         
-                        # unglued 네임서버 처리
                         if not new_nameservers:
                             for ns_name in ns_names:
                                 try:
@@ -210,15 +234,12 @@ def lookup(target_name: dns.name.Name,
                             found_next = True
                             break
                     else:
-                        # NS 레코드가 아닌 다른 AUTHORITY (예: SOA) - 결과 없음
-                        # 이건 정상적인 "도메인 없음" 응답
                         CACHE[cache_key] = response
                         return response
                         
             except Exception as e:
                 continue
         
-        # 모든 서버를 시도했지만 결과가 없으면 빈 응답 반환
         if not found_next:
             response = dns.message.make_response(outbound_query)
             CACHE[cache_key] = response
